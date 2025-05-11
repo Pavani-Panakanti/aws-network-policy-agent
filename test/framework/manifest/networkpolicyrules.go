@@ -69,8 +69,10 @@ func (ir *IngressRuleBuilder) AddPeer(nsSelector map[string]string, podSelector 
 }
 
 func (ir *IngressRuleBuilder) AddPort(port int, protocol v1.Protocol) *IngressRuleBuilder {
-	portObj := network.NetworkPolicyPort{
-		Protocol: &protocol,
+	portObj := network.NetworkPolicyPort{}
+
+	if string(protocol) != "" {
+		portObj.Protocol = &protocol
 	}
 
 	if port != -1 {
@@ -107,8 +109,10 @@ func (er *EgressRuleBuilder) AddPeer(nsSelector map[string]string, podSelector m
 }
 
 func (er *EgressRuleBuilder) AddPort(port int, protocol v1.Protocol) *EgressRuleBuilder {
-	portObj := network.NetworkPolicyPort{
-		Protocol: &protocol,
+	portObj := network.NetworkPolicyPort{}
+
+	if string(protocol) != "" {
+		portObj.Protocol = &protocol
 	}
 
 	if port != -1 {
