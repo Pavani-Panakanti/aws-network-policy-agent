@@ -195,7 +195,16 @@ func checkAndDeriveL4InfoFromAnyMatchingCIDRs(firewallRule string,
 func assertEquivalent(t *testing.T, ruleMap map[string]EbpfFirewallRules, target string) {
 	t.Helper()
 	linear := checkAndDeriveL4InfoFromAnyMatchingCIDRs(target, ruleMap)
-	trie := checkAndDeriveL4InfoFromAnyMatchingCIDRsTrie(target, buildTrie(ruleMap), ruleMap)
+	// The trie implementation stores a slice of rules per CIDR; wrap each rule so the
+	// oracle can stay a plain map. Deliberately no prefix-length guards here: the
+	// oracle's value is being an INDEPENDENT statement of the semantics, and copying
+	// the implementation's guards into it would make it compare the implementation
+	// against itself.
+	perCIDR := make(map[string][]EbpfFirewallRules, len(ruleMap))
+	for cidr, r := range ruleMap {
+		perCIDR[cidr] = []EbpfFirewallRules{r}
+	}
+	trie := checkAndDeriveL4InfoFromAnyMatchingCIDRsTrie(target, buildTrie(ruleMap), perCIDR)
 	assert.Equal(t, portSet(linear), portSet(trie),
 		"trie result must equal linear result for target %s", target)
 }

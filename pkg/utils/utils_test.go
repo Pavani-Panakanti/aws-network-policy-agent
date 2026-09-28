@@ -714,6 +714,30 @@ func TestIsNonHostCIDR(t *testing.T) {
 			},
 			want: true,
 		},
+		{
+			// An IPv6 /32 is a 2^96 block, not a host route. A family-blind check on
+			// the prefix-length string classified it as a host CIDR, which kept such
+			// rules out of the containment lookup entirely.
+			name: "IPv6 /32 is not a host entry",
+			args: args{
+				ipAddr: "2001:db8::/32",
+			},
+			want: true,
+		},
+		{
+			name: "address with no prefix length",
+			args: args{
+				ipAddr: "10.0.0.1",
+			},
+			want: false,
+		},
+		{
+			name: "unparseable input",
+			args: args{
+				ipAddr: "not-a-cidr",
+			},
+			want: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

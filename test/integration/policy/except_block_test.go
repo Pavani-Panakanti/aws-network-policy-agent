@@ -25,10 +25,35 @@ func printNetworkPolicyYAML(np *network.NetworkPolicy) {
 	fmt.Printf("Applied NetworkPolicy YAML:\n%s\n", string(bytes))
 }
 
+// probeAttempts bounds the retry in tcpProbeWithRetry below.
+const probeAttempts = 3
+
+// tcpProbeWithRetry retries the exec, not the verdict. TCPProbe reaches the kubelet
+// through the apiserver and fails transiently, and a non-nil error inside a
+// Consistently window fails the whole window immediately, reporting an enforcement
+// change that never happened. Only a successful probe's verdict is returned, so a
+// retry can never turn a real CLOSE into an OPEN. Mirrors execInPod in
+// test/integration/ebpf/conntrack_poisoning_test.go, keeping the retry local to the
+// spec rather than changing the shared PodManager used by other suites.
+func tcpProbeWithRetry(ns, pod, ip string, port int) (string, error) {
+	var out string
+	var err error
+	for attempt := 1; attempt <= probeAttempts; attempt++ {
+		out, err = fw.PodManager.TCPProbe(ns, pod, ip, port)
+		if err == nil {
+			return out, nil
+		}
+		GinkgoWriter.Printf("TCPProbe to %s:%d attempt %d/%d failed: %v\n", ip, port, attempt, probeAttempts, err)
+		time.Sleep(utils.ProbeInterval)
+	}
+	return "", err
+}
+
 type ipFamilyConfig struct {
 	maskLen    int
 	catchAll   string
 	extProbeIP string
+	hostMask   string
 }
 
 // ipFamilyConfigForIP derives the except-block settings from the server pod IP.
@@ -39,12 +64,14 @@ func ipFamilyConfigForIP(ip string) ipFamilyConfig {
 			maskLen:    64,
 			catchAll:   "::/0",
 			extProbeIP: "2001:4860:4860::8888",
+			hostMask:   "/128",
 		}
 	}
 	return ipFamilyConfig{
 		maskLen:    16,
 		catchAll:   "0.0.0.0/0",
 		extProbeIP: "8.8.8.8",
+		hostMask:   "/32",
 	}
 }
 
@@ -201,6 +228,104 @@ var _ = Describe("IPBlock Except Test Cases", func() {
 					return fw.PodManager.TCPProbe(clientNamespace, clientName, serverIP, blockPort)
 				}, utils.StabilityWindow, utils.ProbeInterval).Should(Equal("CLOSE"),
 					"deny on excepted port %d did not persist through the allow probes", blockPort)
+			})
+		})
+	})
+
+	// Regression for github.com/aws/aws-network-policy-agent#180.
+	//
+	// Two egress rules on the SAME catch-all CIDR: one carries a port and NO
+	// except, the other carries an except covering the server. Kubernetes rules
+	// are additive (a union of allows) and an ipBlock `except` is scoped to the
+	// rule that lists it, so the ported rule must still reach the server.
+	//
+	// Before the fix the except CIDR was given an unconditional deny-all entry
+	// and inherited nothing, so the allowed port to the server was DENIED. That
+	// broke real policies of the form "DNS to everywhere, everything else only to
+	// public IPs", because the cluster DNS service sits inside the excepted range.
+	Context("Additive semantics: ported catch-all rule with no except, plus a catch-all rule excepting the server", func() {
+		BeforeEach(func() {
+			By("Applying two catch-all egress rules, only one of which excepts the server")
+			err := fw.NamespaceManager.CreateNamespace(ctx, clientNamespace)
+			Expect(err).ToNot(HaveOccurred())
+			cfg := ipFamilyConfigForIP(serverIP)
+			// Derive the host mask from the same source as the catch-all, the server
+			// pod IP, rather than from the -ip-family flag: the two disagreeing would
+			// build a /32 on a v6 address, which the API server rejects.
+			serverHostRoute := serverIP + cfg.hostMask
+
+			// Rule 1: allowPort to EVERYTHING, no except. The union of allows means
+			// this must reach the server even though rule 2 excepts it.
+			portedRule := manifest.NewEgressRuleBuilder().
+				AddPeer(nil, nil, cfg.catchAll).
+				AddPort(allowPort, v1.ProtocolTCP).
+				Build()
+
+			// Rule 2: all ports to everything EXCEPT the server.
+			exceptRule := manifest.NewEgressRuleBuilder().
+				AddPeer(nil, nil, cfg.catchAll, serverHostRoute).
+				Build()
+
+			policy = manifest.NewNetworkPolicyBuilder().
+				Namespace(clientNamespace).
+				Name("egress-additive-except-policy").
+				PodSelector("app", clientName).
+				AddEgressRule(portedRule).
+				AddEgressRule(exceptRule).
+				Build()
+
+			printNetworkPolicyYAML(policy)
+			Expect(fw.NetworkPolicyManager.CreateNetworkPolicy(ctx, policy)).To(Succeed())
+
+			fmt.Printf("Creating client pod %s in namespace %s\n", clientName, clientNamespace)
+			clientPod = deployClient(clientName)
+		})
+
+		It("should allow the ported rule to reach the excepted server, deny its other ports, and allow all ports elsewhere", func() {
+			cfg := ipFamilyConfigForIP(serverIP)
+
+			// Deny converging first proves enforcement is active, so a later
+			// ALLOW cannot be mistaken for "no policy programmed yet".
+			By(fmt.Sprintf("denying egress to the excepted server on port %d", blockPort), func() {
+				Eventually(func() (string, error) {
+					return fw.PodManager.TCPProbe(clientNamespace, clientName, serverIP, blockPort)
+				}, utils.EnforcementTimeout, utils.ProbeInterval).Should(Equal("CLOSE"),
+					"expected deny to the excepted server on port %d, which no rule allows", blockPort)
+			})
+
+			// The regression itself: the ported rule has no except, so the union
+			// of allows must let it through to the excepted server.
+			By(fmt.Sprintf("allowing egress to the excepted server on port %d from the rule with no except", allowPort), func() {
+				Eventually(func() (string, error) {
+					return fw.PodManager.TCPProbe(clientNamespace, clientName, serverIP, allowPort)
+				}, utils.ProbeTimeout, utils.ProbeInterval).Should(Equal("OPEN"),
+					"expected allow to the excepted server on port %d: the ported rule lists no except, "+
+						"so an except on another rule must not suppress it", allowPort)
+			})
+
+			By("allowing all ports to endpoints outside the except", func() {
+				Eventually(func() (string, error) {
+					return fw.PodManager.TCPProbe(clientNamespace, clientName, cfg.extProbeIP, 53)
+				}, utils.ProbeTimeout, utils.ProbeInterval).Should(Equal("OPEN"),
+					"expected allow to an external endpoint, which only the all-ports rule covers")
+			})
+
+			By(fmt.Sprintf("confirming the allow on port %d holds and did not flap", allowPort), func() {
+				Consistently(func() (string, error) {
+					return tcpProbeWithRetry(clientNamespace, clientName, serverIP, allowPort)
+				}, utils.StabilityWindow, utils.ProbeInterval).Should(Equal("OPEN"),
+					"allow to the excepted server on port %d did not persist", allowPort)
+			})
+
+			// Hold the deny as well. An allow-only window cannot tell "the policy still
+			// holds" from "the policy was dropped and everything is allowed now", and
+			// the latter is exactly the failure mode this spec exists to catch.
+			By(fmt.Sprintf("confirming the deny on port %d still holds", blockPort), func() {
+				Consistently(func() (string, error) {
+					return tcpProbeWithRetry(clientNamespace, clientName, serverIP, blockPort)
+				}, utils.StabilityWindow, utils.ProbeInterval).Should(Equal("CLOSE"),
+					"deny on port %d did not persist, so the allow above may reflect a dropped policy "+
+						"rather than correct enforcement", blockPort)
 			})
 		})
 	})
