@@ -28,23 +28,39 @@
 // in the v4 sub-trie.
 //
 // The CIDR is stored in canonical form (ipNet.String() — host bits masked).
-// The caller canonicalizes CIDRs before insertion (fw_rule_processor.go line 112),
-// and insert() itself calls net.ParseCIDR which masks host bits, so the stored
-// key always matches what the nonHostCIDRs map uses as its key.
+// ComputeMapEntriesFromEndpointRules canonicalizes each rule's IPCidr before
+// insertion, and insert() itself calls net.ParseCIDR which masks host bits, so the
+// stored key always matches what the nonHostCIDRs map uses as its key.
 //
 // ## Query Semantics (findContainingKeys)
 //
 // Given an IP, the trie walks from root along the IP's bits, collecting cidrKey
-// at every node visited. This yields all CIDRs whose prefix contains the IP,
-// ordered from shortest prefix (most general) to longest (most specific).
+// at every node visited, ordered from shortest prefix (most general) to longest
+// (most specific).
 //
-// The caller then looks up each returned key in the nonHostCIDRs map to collect
-// the associated L4 port info, skipping entries where the IP falls in an Except block.
+// This is NOT the same as "every CIDR that contains the IP". The walk spans the full
+// address width, so it also returns keys that are strict SUBNETS of the queried
+// prefix whenever they share its network address: querying 10.0.0.0/8 also yields
+// 10.0.0.0/24. A subnet does not contain the query, and letting one donate its ports
+// would allow them across the whole enclosing prefix, so
+// checkAndDeriveL4InfoFromAnyMatchingCIDRsTrie discards any returned key whose
+// prefix is longer than the query's. That filter is load-bearing, not redundant.
+//
+// The caller then looks up each returned key in nonHostCIDRs, which holds a SLICE of
+// rules per CIDR rather than one merged rule. Each rule is tested independently: it
+// donates its ports only if its own Except list covers neither the query nor a
+// broader prefix than it. Several rules can share a CIDR with different port sets and
+// different Except lists, so a merged view would pair one rule's ports with another
+// rule's excepts.
+//
+// Each query costs a net.ParseCIDR per returned key for that prefix-length filter,
+// which is a small constant beside the O(N) scan the trie replaces.
 //
 // ## Lifecycle
 //
 // The trie is built once per reconcile (in ComputeMapEntriesFromEndpointRules) from
-// the non-host CIDR rules in the PolicyEndpoint spec, queried for every host-CIDR
-// rule to find overlapping port permissions, and discarded after reconcile completes.
-// It is never shared across goroutines.
+// the non-host CIDR rules in the PolicyEndpoint spec, and queried twice: once for
+// every rule whose CIDR falls inside a broader one, and again for every ipBlock
+// Except CIDR, which inherits the ports of containing rules that do not except it.
+// It is discarded after reconcile completes and is never shared across goroutines.
 package fwruleprocessor

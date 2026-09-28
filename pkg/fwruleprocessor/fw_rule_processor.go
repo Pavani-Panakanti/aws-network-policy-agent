@@ -60,13 +60,21 @@ func NewFirewallRuleProcessor(nodeIP string, hostMask string, enableIPv6 bool) *
 //        - Ensures all entries contain a /mask (using hostMask if omitted).
 //        - Filters out IPv4 rules in IPv6 clusters and vice versa.
 //        - For rules without any L4 port info, a catch-all rule is inserted to match all traffic.
+//        - Normalizes the rule's `except` list the same way (mask defaulted, canonicalized,
+//          unparseable entries dropped), so every later consumer sees canonical CIDRs.
 //   4. For any rule whose CIDR is more specific (e.g., /24) and falls within a broader one (e.g., /16),
-//      we check existing rules in the map to see if it matches a prior CIDR. If it does and is not part of
-//      that CIDR's "except" list, we inherit the broader rule's ports into the current one.
-//      This ensures that the specific CIDR behaves consistently with the broader scope's intent.
-//   5. We then handle all `except` CIDRs at the end.
-//        - If not already in the map, each `except` CIDR is added explicitly with a deny-all L4 entry.
-//        - This ensures specific excluded IP ranges override broader allow rules correctly in the LPM match tree.
+//      we walk a containment trie for every CIDR that contains it. Each rule recorded against a
+//      containing CIDR is tested INDEPENDENTLY: that rule donates its ports only if its own
+//      "except" list does not cover the current CIDR. Testing per rule matters because several
+//      rules can share one CIDR with different port sets and different except lists, so a merged
+//      view would pair one rule's ports with another rule's excepts.
+//   5. We then handle all `except` CIDRs at the end. An `except` is scoped to the rule
+//      that lists it, and rules are additive (a union of allows), so an except CIDR
+//      inherits the ports of every OTHER rule that contains it and does not itself
+//      except it. It gets a deny-all L4 entry only when there is nothing to inherit,
+//      which keeps the entry non-empty so ComputeTrieValue does not fall back to
+//      allow-all. Either way its longer prefix wins the LPM match over the broader
+//      rule, which is what carves it out.
 //   6. Finally, all CIDRs are encoded into trie keys and their corresponding merged/derived L4 info is encoded
 //      into the values, forming the output map.
 
@@ -75,7 +83,10 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 	firewallMap := make(map[string][]byte)
 	cidrsMap := make(map[string]EbpfFirewallRules)
 	exceptCidrs := make(map[string]struct{})
-	nonHostCIDRs := make(map[string]EbpfFirewallRules)
+	// Every rule seen for a given CIDR is kept separately, un-merged: a CIDR can
+	// appear in several rules with different port sets AND different except
+	// lists, and inheritance has to test each (ports, except) pair on its own.
+	nonHostCIDRs := make(map[string][]EbpfFirewallRules)
 	containmentTrie := newCIDRTrie()
 
 	//Traffic from the local node should always be allowed. Add NodeIP by default to map entries.
@@ -111,6 +122,26 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 			continue
 		}
 
+		// Normalize the except list in place before anything consumes it. An except
+		// may be authored as a bare address (the CRD does not require a mask). Left
+		// raw it breaks two things: net.ParseCIDR fails in the except-match
+		// predicate below, so the entry silently fails to suppress inherited ports,
+		// and the map-emit loop dereferences a nil *net.IPNet -> agent panic.
+		normalizedExcept := firewallRule.Except[:0:0]
+		for _, exceptCidr := range firewallRule.Except {
+			e := string(exceptCidr)
+			if !strings.Contains(e, "/") {
+				e += f.hostMask
+			}
+			_, eNet, err := net.ParseCIDR(e)
+			if err != nil || eNet == nil {
+				log().Warnf("Skipping unparseable except CIDR %q on rule %s", string(exceptCidr), string(firewallRule.IPCidr))
+				continue
+			}
+			normalizedExcept = append(normalizedExcept, v1alpha1.NetworkAddress(eNet.String()))
+		}
+		firewallRule.Except = normalizedExcept
+
 		// Track this rule's except CIDRs to handle later.
 		for _, exceptCidr := range firewallRule.Except {
 			exceptCidrs[string(exceptCidr)] = struct{}{}
@@ -122,9 +153,20 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 			addCatchAllL4Entry(&firewallRule)
 		}
 
+		// Snapshot the rule exactly as authored (before any cross-rule merging)
+		// so inheritance can later pair this rule's ports with this rule's own
+		// except list.
+		ownRule := firewallRule
+		ownRule.L4Info = append([]v1alpha1.Port{}, firewallRule.L4Info...)
+		ownRule.Except = append([]v1alpha1.NetworkAddress{}, firewallRule.Except...)
+
 		if existingFirewallRuleInfo, ok := cidrsMap[string(firewallRule.IPCidr)]; ok {
+			// Only L4Info is merged. The except lists are deliberately NOT merged:
+			// suppression reads the per-rule ownRule snapshots in nonHostCIDRs so that
+			// each rule's ports are tested against that same rule's excepts. Merging
+			// them here is what previously paired one rule's ports with another rule's
+			// excepts and defeated inheritance.
 			firewallRule.L4Info = append(firewallRule.L4Info, existingFirewallRuleInfo.L4Info...)
-			firewallRule.Except = append(firewallRule.Except, existingFirewallRuleInfo.Except...)
 		} else {
 			cidrL4Info = checkAndDeriveL4InfoFromAnyMatchingCIDRsTrie(string(firewallRule.IPCidr), containmentTrie, nonHostCIDRs)
 			if len(cidrL4Info) > 0 {
@@ -134,7 +176,7 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 		cidrsMap[string(firewallRule.IPCidr)] = firewallRule
 		if utils.IsNonHostCIDR(string(firewallRule.IPCidr)) {
 			_, alreadyInTrie := nonHostCIDRs[string(firewallRule.IPCidr)]
-			nonHostCIDRs[string(firewallRule.IPCidr)] = firewallRule
+			nonHostCIDRs[string(firewallRule.IPCidr)] = append(nonHostCIDRs[string(firewallRule.IPCidr)], ownRule)
 			if !alreadyInTrie {
 				containmentTrie.insert(string(firewallRule.IPCidr))
 			}
@@ -143,20 +185,50 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 
 	// Go through except CIDRs and append DENY all rule to the L4 info
 	for exceptCidr := range exceptCidrs {
-		canonicalExcept := exceptCidr
-		if _, ipNet, err := net.ParseCIDR(exceptCidr); err == nil {
-			canonicalExcept = ipNet.String()
+		// Already normalized and canonical at ingestion.
+		// Same gates the rule loop applies: a wrong-family except would otherwise
+		// be reinterpreted in the cluster's family (a v4 except in a v6 cluster
+		// emitted keys like a00::/8, hard-denying unrelated v6 space), and an
+		// except naming the node IP would overwrite the unconditional node
+		// allow-all seeded above and break kubelet probes.
+		if f.shouldSkipExcept(exceptCidr) {
+			log().Debugf("Skipping except CIDR (wrong family, or it is the node's host route): %s", exceptCidr)
+			continue
 		}
-		if _, ok := cidrsMap[canonicalExcept]; !ok {
+		if _, ok := cidrsMap[exceptCidr]; !ok {
 			exceptFirewall := EbpfFirewallRules{
-				IPCidr: v1alpha1.NetworkAddress(canonicalExcept),
+				IPCidr: v1alpha1.NetworkAddress(exceptCidr),
 				Except: []v1alpha1.NetworkAddress{},
 				L4Info: []v1alpha1.Port{},
 			}
-			addDenyAllL4Entry(&exceptFirewall)
-			cidrsMap[canonicalExcept] = exceptFirewall
+			// An except CIDR is only carved out of the rule that listed it.
+			// Any *other* rule whose CIDR contains this one and which does not
+			// except it still allows its ports here, because egress rules are
+			// additive (a union of allows), so inherit those first.
+			inherited := checkAndDeriveL4InfoFromAnyMatchingCIDRsTrie(exceptCidr, containmentTrie, nonHostCIDRs)
+			if len(inherited) > 0 {
+				// Emit only the inherited allows. Ports not listed here fall
+				// through the datapath loop to its default, DENY, so the
+				// deny-all marker is not needed -- and must not be added,
+				// because the datapath returns DENY the moment it sees it.
+				// Caveat: that fallthrough is not absolute for IP protocol 0.
+				// ComputeTrieValue zero-fills the unused slots of every value, a zero
+				// slot decodes as {protocol:0, start_port:0}, and the datapath compares
+				// trie_val->protocol against the packet's IP protocol, so a protocol-0
+				// packet matches the tail. handle_egress assigns flow_key.protocol
+				// unconditionally and its protocol switch has no default arm, so such a
+				// packet does reach the evaluator. This is a pre-existing property of
+				// every non-except entry on main, not one introduced here, and closing
+				// it needs a datapath change.
+				exceptFirewall.L4Info = append(exceptFirewall.L4Info, inherited...)
+			} else {
+				// Nothing to allow here. The deny-all marker keeps the entry
+				// non-empty so ComputeTrieValue does not fall back to allow-all.
+				addDenyAllL4Entry(&exceptFirewall)
+			}
+			cidrsMap[exceptCidr] = exceptFirewall
 		}
-		log().Debugf("Parsed Except CIDR: %s (canonical: %s)", exceptCidr, canonicalExcept)
+		log().Debugf("Parsed Except CIDR (already canonical): %s", exceptCidr)
 	}
 
 	for key, value := range cidrsMap {
@@ -217,7 +289,7 @@ func addDenyAllL4Entry(firewallRule *EbpfFirewallRules) {
 }
 
 func checkAndDeriveL4InfoFromAnyMatchingCIDRsTrie(firewallRule string,
-	trie *cidrTrie, nonHostCIDRs map[string]EbpfFirewallRules) []v1alpha1.Port {
+	trie *cidrTrie, nonHostCIDRs map[string][]EbpfFirewallRules) []v1alpha1.Port {
 	var matchingCIDRL4Info []v1alpha1.Port
 
 	_, ipToCheck, err := net.ParseCIDR(firewallRule)
@@ -225,23 +297,51 @@ func checkAndDeriveL4InfoFromAnyMatchingCIDRsTrie(firewallRule string,
 		return matchingCIDRL4Info
 	}
 
+	// findContainingKeys walks the full address width, so it also returns keys
+	// that are strict SUBNETS of the query when they share its network address
+	// (e.g. querying 10.0.0.0/8 returns 10.0.0.0/24). A subnet does not contain
+	// the query and must never donate ports to it - doing so would allow the
+	// subnet's ports across the whole enclosing block. The guard is applied
+	// unconditionally at both call sites rather than relying on processing order:
+	// sortFirewallRulesByPrefixLength splits the raw IPCidr string without
+	// canonicalizing, so a v4-mapped form like ::ffff:10.0.0.0/104 sorts as 104 and
+	// would be processed after v4 prefixes that are its own subnets.
+	queryOnes, _ := ipToCheck.Mask.Size()
 	containingKeys := trie.findContainingKeys(ipToCheck.IP)
 
 	for _, cidrKey := range containingKeys {
-		cidrFirewallInfo, ok := nonHostCIDRs[cidrKey]
-		if !ok {
+		_, keyNet, keyErr := net.ParseCIDR(cidrKey)
+		if keyErr != nil || keyNet == nil {
 			continue
 		}
-		foundInExcept := false
-		for _, except := range cidrFirewallInfo.Except {
-			_, exceptEntry, _ := net.ParseCIDR(string(except))
-			if exceptEntry != nil && exceptEntry.Contains(ipToCheck.IP) {
-				foundInExcept = true
-				break
-			}
+		keyOnes, _ := keyNet.Mask.Size()
+		if keyOnes > queryOnes || !keyNet.Contains(ipToCheck.IP) {
+			continue
 		}
-		if !foundInExcept {
-			matchingCIDRL4Info = append(matchingCIDRL4Info, cidrFirewallInfo.L4Info...)
+		// Each rule on this CIDR is tested independently: its except list only
+		// suppresses the ports that same rule contributed.
+		for _, cidrFirewallInfo := range nonHostCIDRs[cidrKey] {
+			foundInExcept := false
+			for _, except := range cidrFirewallInfo.Except {
+				_, exceptEntry, _ := net.ParseCIDR(string(except))
+				if exceptEntry == nil {
+					continue
+				}
+				// Mirror of the donor-side guard above. Contains() tests a single
+				// representative address, so an except that is a strict subset of
+				// the query - aligned at the query's network address - would
+				// otherwise suppress this donor across the whole query block. Only
+				// an except that covers the query as a whole carves it out; a
+				// narrower except gets its own longer-prefix key in the except pass.
+				exceptOnes, _ := exceptEntry.Mask.Size()
+				if exceptOnes <= queryOnes && exceptEntry.Contains(ipToCheck.IP) {
+					foundInExcept = true
+					break
+				}
+			}
+			if !foundInExcept {
+				matchingCIDRL4Info = append(matchingCIDRL4Info, cidrFirewallInfo.L4Info...)
+			}
 		}
 	}
 	return matchingCIDRL4Info
@@ -282,7 +382,110 @@ func mergeDuplicateL4Info(ports []v1alpha1.Port) []v1alpha1.Port {
 		result = append(result, port)
 	}
 
+	// An entry encoding to ANY_IP_PROTOCOL with start port 0 matches unconditionally
+	// in the datapath, so every other allow in the same value is dead weight. The
+	// predicate deliberately ignores EndPort: the datapath tests start_port ==
+	// ANY_PORT as its first disjunct and short-circuits, so end_port is never read
+	// for such an entry. Collapsing keeps the broadest allow from being the entry
+	// discarded when the value exceeds the ebpf 24-entry cap.
+	hasDenyMarker := false
+	catchAllIdx := -1
+	for i, pt := range result {
+		proto := encodedProtocol(pt)
+		if proto == utils.RESERVED_IP_PROTOCOL_NUMBER {
+			hasDenyMarker = true
+			continue
+		}
+		startPort := int32(0)
+		if pt.Port != nil {
+			startPort = *pt.Port
+		}
+		// Test the ENCODED triple rather than the Go representation: a nil Port and
+		// a pointer to 0 both encode to start_port 0, and a nil Protocol encodes to
+		// ANY_IP_PROTOCOL, so all three are unconditional allows.
+		if proto == utils.ANY_IP_PROTOCOL && startPort == 0 {
+			catchAllIdx = i
+		}
+	}
+	if catchAllIdx >= 0 && !hasDenyMarker {
+		// Return a canonical entry rather than result[catchAllIdx]. The predicate does
+		// not look at EndPort, so more than one entry can qualify while encoding to
+		// different bytes (e.g. {nil Protocol, EndPort:100} alongside the synthesized
+		// catch-all), and catchAllIdx keeps whichever came last in map order. Emitting
+		// the canonical form keeps the output byte-stable for every qualifying shape.
+		return []v1alpha1.Port{{Protocol: &CATCH_ALL_PROTOCOL}}
+	}
+
+	// Sort so the emitted order is stable. uniquePorts is a Go map, and values
+	// longer than the ebpf 24-entry cap get truncated by ComputeTrieValue, so an
+	// unstable order would make the ENFORCED subset differ between reconciles of
+	// identical input.
+	sort.SliceStable(result, func(i, j int) bool {
+		pi, pj := portSortKey(result[i]), portSortKey(result[j])
+		if pi[0] != pj[0] {
+			return pi[0] < pj[0]
+		}
+		if pi[1] != pj[1] {
+			return pi[1] < pj[1]
+		}
+		return pi[2] < pj[2]
+	})
+
 	return result
+}
+
+// encodedProtocol returns the protocol byte ComputeTrieValue will write for this
+// Port. It mirrors utils.deriveProtocolValue, including its treatment of a nil or
+// unrecognised Protocol as ANY_IP_PROTOCOL, so the sort key and the catch-all test
+// can never disagree with what the datapath actually compares.
+func encodedProtocol(p v1alpha1.Port) int {
+	if p.Protocol == nil {
+		return utils.ANY_IP_PROTOCOL
+	}
+	switch *p.Protocol {
+	case corev1.ProtocolTCP:
+		return utils.TCP_PROTOCOL_NUMBER
+	case corev1.ProtocolUDP:
+		return utils.UDP_PROTOCOL_NUMBER
+	case corev1.ProtocolSCTP:
+		return utils.SCTP_PROTOCOL_NUMBER
+	case DENY_ALL_PROTOCOL:
+		return utils.RESERVED_IP_PROTOCOL_NUMBER
+	default:
+		// CATCH_ALL_PROTOCOL and anything unrecognised.
+		return utils.ANY_IP_PROTOCOL
+	}
+}
+
+// portSortKey yields a total order over a Port: breadth, then start, then end.
+//
+// The primary key is a BREADTH rank, not the encoded protocol byte. Truncation at
+// the ebpf 24-entry cap drops whatever sorts last, so the order has to put the
+// broadest allows out of harm's way: an ANY-protocol entry covers strictly more
+// traffic than a TCP/UDP/SCTP one on the same port, and the deny-all marker must
+// sort last of all so a truncation never discards an allow in favour of it. Using
+// the raw protocol byte inverted this, because ANY_IP_PROTOCOL is 254 and so ranked
+// second-to-last, making the broadest allow the first entry discarded.
+//
+// encodedProtocol stays the single source of truth for what the datapath compares;
+// only this ordering is remapped.
+func portSortKey(p v1alpha1.Port) [3]int {
+	k := [3]int{}
+	switch proto := encodedProtocol(p); proto {
+	case utils.ANY_IP_PROTOCOL:
+		k[0] = 0 // broadest allow: sorts first, truncated last
+	case utils.RESERVED_IP_PROTOCOL_NUMBER:
+		k[0] = 1 << 16 // deny marker: sorts last
+	default:
+		k[0] = proto // 6, 17, 132 - all above ANY, all below the marker
+	}
+	if p.Port != nil {
+		k[1] = int(*p.Port)
+	}
+	if p.EndPort != nil {
+		k[2] = int(*p.EndPort)
+	}
+	return k
 }
 
 func (f *FirewallRuleProcessor) ComputeClusterPolicyMapEntriesFromEndpointRules(firewallRules []EbpfFirewallRules) (map[string][]byte, error) {
@@ -366,6 +569,29 @@ func (f *FirewallRuleProcessor) normalizeCIDR(cidr string) string {
 		return ipNet.String()
 	}
 	return cidr
+}
+
+// shouldSkipExcept gates the except pass. It deliberately does NOT reuse
+// shouldSkipRule, because utils.IsNodeIP compares the node IP against a CIDR's
+// NETWORK address with no host-route check. Reusing it dropped every except whose
+// first address happened to be the node IP - on a node at 10.0.1.128 the except
+// 10.0.1.128/25 was deleted entirely, leaving the enclosing rule's ports allowed
+// across all 127 other addresses in the excepted block.
+//
+// Only an except that is exactly the node's host route can collide with the node
+// allow-all seeded at the top of ComputeMapEntriesFromEndpointRules, because only
+// that one encodes to the same LPM key. Anything broader loses to the /32 (or
+// /128) by longest-prefix match, so it is safe - and necessary - to emit.
+func (f *FirewallRuleProcessor) shouldSkipExcept(cidr string) bool {
+	if f.enableIPv6 != isIPv6(cidr) {
+		return true
+	}
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil || ipNet == nil {
+		return true
+	}
+	ones, bits := ipNet.Mask.Size()
+	return ones == bits && utils.IsNodeIP(f.nodeIP, cidr)
 }
 
 func (f *FirewallRuleProcessor) shouldSkipRule(cidr string) bool {

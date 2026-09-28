@@ -494,12 +494,16 @@ func IsNodeIP(nodeIP string, ipCidr string) bool {
 }
 
 func IsNonHostCIDR(ipAddr string) bool {
-	ipSplit := strings.Split(ipAddr, "/")
-	//Ignore Catch All IP entry as well
-	if ipSplit[1] != "32" && ipSplit[1] != "128" {
-		return true
+	// Compare the prefix length against the address family's width rather than
+	// against the literal strings "32"/"128": an IPv6 /32 is a 2^96-address block,
+	// not a host route, and string matching misclassified it as a host CIDR.
+	// Also avoids indexing a split on input that has no "/".
+	_, ipNet, err := net.ParseCIDR(ipAddr)
+	if err != nil || ipNet == nil {
+		return false
 	}
-	return false
+	ones, bits := ipNet.Mask.Size()
+	return ones != bits
 }
 
 func ConvByteArrayToIP(ipInInt uint32) string {
